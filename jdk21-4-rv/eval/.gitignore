@@ -1,0 +1,10 @@
+lib/
+compiled/
+woven/
+
+# run outputs and crash dumps
+results/
+results-*/
+ajcore.*
+*.log
+*.jfr

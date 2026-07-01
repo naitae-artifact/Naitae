@@ -1,0 +1,8 @@
+.git
+.DS_Store
+lazymop
+data
+experiments/analysis
+experiments/projects
+jdk21-4-rv/build
+**/target

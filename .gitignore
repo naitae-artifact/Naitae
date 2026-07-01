@@ -1,0 +1,6 @@
+.DS_Store
+
+# Local build output (do not commit)
+/jdk21-4-rv/build/
+/jdk21-4-rv/config.log
+/jdk21-4-rv/configure.log

@@ -1,0 +1,377 @@
+IndexingTree GC Integration — Current State and Young GC Plan
+=============================================================
+
+Based on: "A Virtual Machine Support for Parametric Monitoring" (PLDI 2016)
+Port:     OpenJDK 7 -> OpenJDK 21 (jdk21-rv)
+
+
+1. DESIGN OVERVIEW
+------------------
+
+The IndexingTree table field is hidden from normal GC traversal by zeroing
+the oop map (InstanceIndexingTreeKlass::update_nonstatic_oop_maps).  The
+field is re-added explicitly in oop_oop_iterate, gated by collector state
+flags.  This follows the same pattern as InstanceRefKlass (referent field).
+
+During GC marking/copying, the table is skipped.  A cleanup task then walks
+the table, removes entries with dead keys, and marks/copies the survivors.
+Forwarding state or mark bits serve as the liveness signal — this works
+precisely because the table was hidden from the normal mark/copy phase.
+
+Two-phase cleanup (IndexingTreeManager::clean_tree):
+  Phase 1  Walk table, unlink entries where any key is dead.
+  Phase 2  keep_alive the table array and surviving chain heads.
+           The collector's drain recursively marks/copies sub-objects.
+
+
+2. CURRENT IMPLEMENTATION (Full GC / Remark only)
+--------------------------------------------------
+
+Flag: InstanceIndexingTreeKlass::_full_gc_marking
+Gate: oop_oop_iterate skips table when _full_gc_marking && DO_DISCOVERY
+Hook: IndexingTreeCleanupTask in ReferenceProcessor::process_discovered_references()
+
+Each collector sets the flag around its marking + ref-processing phase.
+The cleanup task receives the collector's own is_alive / keep_alive /
+complete_gc closures, so the algorithm is collector-agnostic.
+
+
+Serial (genMarkSweep.cpp)
+~~~~~~~~~~~~~~~~~~~~~~~~~
+  Full GC cycle (mark-sweep-compact):
+
+    Phase 1: Mark live objects
+      |
+      +-- set_full_gc_marking(true)               <-- flag ON
+      |
+      +-- Mark from roots (follow_root_closure)
+      |     oop_oop_iterate with DO_DISCOVERY
+      |     -> table SKIPPED (flag is on)
+      |
+      +-- process_discovered_references()
+      |     Soft -> Weak -> Final -> Phantom refs
+      |     |
+      |     +-- IndexingTreeCleanupTask            <-- cleanup runs here
+      |     |     is_alive:   mark bit check
+      |     |     keep_alive: MarkSweep::mark_and_push
+      |     |     complete:   MarkSweep::follow_stack
+      |     |
+      |     Removes dead entries, marks survivors.
+      |
+      +-- set_full_gc_marking(false)               <-- flag OFF
+
+    Phase 2: Compute new addresses
+    Phase 3: Adjust pointers
+      oop_oop_iterate with DO_FIELDS -> table traced, pointers adjusted
+    Phase 4: Compact
+
+  Young GC cycle (defNewGeneration.cpp):
+
+      young_process_roots()
+        card scanning -> oop_oop_iterate_bounded
+        table traced normally (flag is off, mode is DO_FIELDS)
+        -> dead keys in young gen get copied alongside live ones
+
+      evacuate_followers()
+
+      process_discovered_references()
+        is_alive:   !in_young || is_forwarded
+        keep_alive: copy_to_survivor_space
+        -> IndexingTreeCleanupTask DOES NOT RUN (flag is off)
+
+      swap_spaces()
+
+    Result: Dead entries accumulate until next full GC.
+
+
+Parallel (psParallelCompact.cpp / psScavenge.cpp)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  Full GC cycle (mark-compact):
+
+    Marking Phase
+      |
+      +-- set_full_gc_marking(true)               <-- flag ON
+      |
+      +-- Parallel marking from roots
+      |     oop_oop_iterate with DO_DISCOVERY
+      |     -> table SKIPPED
+      |
+      +-- process_discovered_references()
+      |     +-- IndexingTreeCleanupTask            <-- cleanup runs here
+      |     |     is_alive:   IsAliveClosure (mark bit)
+      |     |     keep_alive: MarkAndPushClosure
+      |     |     complete:   FollowStackClosure
+      |
+      +-- set_full_gc_marking(false)               <-- flag OFF
+
+    Summary Phase
+    Adjustment Phase
+      oop_oop_iterate with DO_FIELDS -> table traced, pointers adjusted
+    Compaction Phase
+
+  Young GC cycle (psScavenge.cpp):
+
+      ScavengeRootsTask (parallel workers)
+        roots scanning + card scanning (psCardTable.cpp)
+        push_contents -> oop_iterate_backwards
+        push_contents_bounded -> oop_iterate with MemRegion
+        table traced normally -> dead keys copied
+
+      process_discovered_references()
+        is_alive:   PSIsAliveClosure (!in_young || is_forwarded)
+        keep_alive: PSKeepAliveClosure (copy_to_survivor_space)
+        -> IndexingTreeCleanupTask DOES NOT RUN
+
+      swap_spaces()
+
+    Result: Dead entries accumulate until next full GC.
+
+
+G1 (g1FullCollector.cpp / g1ConcurrentMark.cpp / g1YoungCollector.cpp)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  Full GC cycle (g1FullCollector.cpp, mark-compact):
+
+    Phase 1: Mark live objects
+      |
+      +-- set_full_gc_marking(true)               <-- flag ON
+      |
+      +-- Parallel marking
+      |     oop_oop_iterate with DO_DISCOVERY -> table SKIPPED
+      |
+      +-- process_discovered_references()
+      |     +-- IndexingTreeCleanupTask            <-- cleanup runs here
+      |
+      +-- set_full_gc_marking(false)               <-- flag OFF
+
+    Phase 2: Prepare for compaction
+    Phase 3: Adjust pointers (DO_FIELDS -> table traced)
+    Phase 4: Compact
+
+  Concurrent remark (g1ConcurrentMark.cpp):
+
+    weak_refs_work()
+      |
+      +-- set_full_gc_marking(true)               <-- flag ON
+      |
+      +-- process_discovered_references()
+      |     +-- IndexingTreeCleanupTask            <-- cleanup runs here
+      |     |     is_alive:   G1CMIsAliveClosure (next mark bitmap)
+      |     |     keep_alive: G1CMKeepAliveClosure
+      |     |     complete:   G1CMDrainMarkingStackClosure
+      |
+      +-- set_full_gc_marking(false)               <-- flag OFF
+
+  Young GC cycle (g1YoungCollector.cpp):
+
+      pre_evacuate_collection_set()
+      evacuate_initial_collection_set()
+        G1ParScanThreadState -> oop_iterate for roots + remembered sets
+        table traced normally -> dead keys evacuated
+
+      evacuate_optional_collection_set()
+
+      post_evacuate_collection_set()
+        process_discovered_references()
+          is_alive:   G1STWIsAliveClosure (in_cset ? is_forwarded : true)
+          keep_alive: G1CopyingKeepAliveClosure
+          -> IndexingTreeCleanupTask DOES NOT RUN
+
+    Result: Dead entries accumulate until next remark or full GC.
+
+
+3. PROPOSED CHANGE: Young GC Cleanup
+-------------------------------------
+
+Add a second flag: _young_gc_active.  When set, oop_oop_iterate skips the
+table during young GC.  After evacuation, the existing cleanup task runs
+using the collector's young-GC is_alive closure (forwarding = alive).
+
+Matches the paper's push_contents / post_push_contents pattern (Figure 5).
+
+Shared changes:
+
+  instanceIndexingTreeKlass.hpp
+    + static bool _young_gc_active;
+    + static void set_young_gc_active(bool v);
+
+  instanceIndexingTreeKlass.inline.hpp
+    skip table when:
+      (_full_gc_marking && DO_DISCOVERY)  -- existing, full GC
+      OR _young_gc_active                 -- new, young GC
+
+  referenceProcessor.cpp
+    run IndexingTreeCleanupTask when:
+      full_gc_marking()                   -- existing
+      OR young_gc_active()                -- new
+
+
+Serial — Young GC with cleanup:
+
+      + set_young_gc_active(true)                  <-- NEW
+
+      young_process_roots()
+        card scanning -> oop_oop_iterate_bounded
+        -> table SKIPPED (young_gc_active is on)
+
+      evacuate_followers()
+
+      process_discovered_references()
+        is_alive:   !in_young || is_forwarded      (existing IsAliveClosure)
+        keep_alive: copy_to_survivor_space          (existing KeepAliveClosure)
+        complete:   evacuate_followers              (existing)
+        |
+        +-- IndexingTreeCleanupTask                 <-- NOW RUNS
+              Dead keys not forwarded -> removed.
+              Surviving entries -> keep_alive copies them.
+              complete_gc -> drains copy stack.
+
+      + set_young_gc_active(false)                 <-- NEW
+
+      swap_spaces()
+
+
+Parallel — Young GC with cleanup:
+
+      + set_young_gc_active(true)                  <-- NEW
+
+      ScavengeRootsTask (parallel workers)
+        push_contents -> oop_iterate_backwards
+        push_contents_bounded -> oop_iterate with MemRegion
+        -> table SKIPPED (young_gc_active is on)
+
+      process_discovered_references()
+        is_alive:   !in_young || is_forwarded      (existing PSIsAliveClosure)
+        keep_alive: copy_to_survivor_space          (existing PSKeepAliveClosure)
+        |
+        +-- IndexingTreeCleanupTask                 <-- NOW RUNS
+
+      + set_young_gc_active(false)                 <-- NEW
+
+      swap_spaces()
+
+
+G1 — Young GC with cleanup:
+
+      pre_evacuate_collection_set()
+      + set_young_gc_active(true)                  <-- NEW
+
+      evacuate_initial_collection_set()
+        oop_iterate for roots + remembered sets
+        -> table SKIPPED (young_gc_active is on)
+
+      evacuate_optional_collection_set()
+
+      post_evacuate_collection_set()
+        process_discovered_references()
+          is_alive:   in_cset ? is_forwarded : true (existing G1STWIsAliveClosure)
+          keep_alive: G1CopyingKeepAliveClosure     (existing)
+          |
+          +-- IndexingTreeCleanupTask               <-- NOW RUNS
+
+      + set_young_gc_active(false)                 <-- NEW
+
+
+4. CHALLENGES AND SOLUTIONS
+----------------------------
+
+Issue 1: No clean liveness point during young GC.
+
+  Problem:
+    Marking (determining what's alive) and evacuation (copying objects)
+    happen simultaneously during young GC.  There's no moment where
+    "all liveness is settled but nothing has moved yet."  By the time
+    our cleanup runs, objects have already been copied.  We're checking
+    liveness on objects that may have been forwarded, copied to to-space,
+    or are still at from-space addresses with forwarding pointers.
+
+  Solution:
+    Hide the table field from GC traversal using the _young_gc_active
+    flag in InstanceIndexingTreeKlass::oop_oop_iterate.  When the GC
+    visits the IndexingTree object during young GC, it skips the table
+    pointer.  The table and its contents are never reached through this
+    path, so dead keys are never copied.
+
+    After evacuation completes, the cleanup task runs inside
+    process_discovered_references().  Keys that were forwarded by some
+    other root are alive; keys still in from-space (not forwarded) are
+    dead.  The forwarding state *is* the liveness signal — precisely
+    because the table was hidden.  This is the same pattern
+    InstanceRefKlass uses for Reference.referent.
+
+    Implementation: _young_gc_active flag set/cleared by each collector
+    around its young GC cycle.  should_skip_table() in
+    instanceIndexingTreeKlass.inline.hpp gates oop_oop_iterate.
+
+  Status: IMPLEMENTED.
+
+
+Issue 2: Card scanning bypasses our klass.
+
+  Problem:
+    The Object[] table array in old gen is a separate heap object with
+    ObjArrayKlass.  When mutator stores write young-gen entry pointers
+    into the old-gen table, cards are dirtied.  During young GC, card
+    scanning invokes ObjArrayKlass::oop_oop_iterate_bounded on the table
+    directly — bypassing InstanceIndexingTreeKlass entirely.  This copies
+    dead young-gen keys to to-space alongside live ones.  Both appear
+    forwarded afterward, so the cleanup task's is_alive check
+    (!in_young || is_forwarded) returns true for everything.  Dead
+    entries cannot be distinguished from live ones.
+
+    Since the tree and table are static-rooted, they get promoted to
+    old gen early.  Every new put/getOrCreate stores a young-gen entry
+    pointer into the old-gen table, dirtying cards.  For long-running
+    monitoring workloads, the table spends most of its lifetime in old
+    gen, making this the dominant case.
+
+  Solution:
+    Before card scanning starts, walk the tree registry
+    (IndexingTreeManager::_tree_storage), get each tree's table array,
+    and clear the dirty cards covering it.  The card scanner then skips
+    the table entirely.  The cleanup task runs after evacuation with a
+    clean forwarding signal — the same mechanism as Issue 1.
+
+    No changes to ObjArrayKlass, no new data structures, no changes to
+    the cleanup algorithm.  The table is simply made invisible to both
+    GC traversal paths: oop_oop_iterate (Issue 1) and card scanning
+    (Issue 2).
+
+    Hook points:
+      Serial:     defNewGeneration.cpp    before young_process_roots()
+      Parallel:   psScavenge.cpp          before ScavengeRootsTask
+      G1:         g1YoungCollector.cpp    in pre_evacuate_collection_set()
+
+  Status: NOT YET IMPLEMENTED.
+
+
+5. CHANGES SUMMARY
+-------------------
+
+  File                                      Change          Lines
+  ----------------------------------------  --------------- -----
+  oops/instanceIndexingTreeKlass.hpp        + flag, getter   ~4
+  oops/instanceIndexingTreeKlass.cpp        + flag init       ~1
+  oops/instanceIndexingTreeKlass.inline.hpp   gate update     ~6
+  gc/shared/referenceProcessor.cpp            gate update     ~3
+  gc/serial/defNewGeneration.cpp            + set/clear flag  ~4
+  gc/parallel/psScavenge.cpp                + set/clear flag  ~4
+  gc/g1/g1YoungCollector.cpp                + set/clear flag  ~4
+  ----------------------------------------  --------------- -----
+  Total                                     7 files          ~26
+
+  No new classes.  No new methods on IndexingTreeManager.
+  Reuses existing is_alive / keep_alive / complete_gc closures.
+
+
+6. COLLECTOR SUPPORT MATRIX (Before -> After)
+----------------------------------------------
+
+  Collector          Full GC     Young GC (before)        Young GC (after)
+  -----------------  ----------  -----------------------  ----------------------
+  Serial             cleanup     deferred to full GC      cleanup via is_forwarded
+  Parallel           cleanup     deferred to full GC      cleanup via is_forwarded
+  G1 Full            cleanup     n/a                      n/a
+  G1 Remark          cleanup     n/a                      n/a
+  G1 Young           n/a         deferred to remark/full  cleanup via is_forwarded
+  ZGC                --          not supported             not supported
+  Shenandoah         --          not supported             not supported

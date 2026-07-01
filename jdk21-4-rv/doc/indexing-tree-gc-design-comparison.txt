@@ -1,0 +1,277 @@
+INDEXING TREE GC INTEGRATION: CURRENT vs OopStorage APPROACH
+=============================================================
+
+Last updated: 2026-05-04
+
+
+BACKGROUND
+----------
+The indexing tree maps (key1, key2, ...) -> monitor. It must behave like a
+weak reference: when any key becomes unreachable from outside the tree, the
+corresponding entry must be removed. The JDK7 paper achieved this by having
+the JVM drive cleanup rather than using Java WeakReferences, avoiding
+ReferenceQueue synchronization overhead and reducing GC iteration cost.
+
+The JDK21 port (this repo) adapts that design to a multi-collector JVM.
+
+
+=============================================================
+CURRENT APPROACH: WeakObjArrayKlass + per-GC cleanup hooks
+=============================================================
+
+DATA LAYOUT
+-----------
+  IndexingTree (InstanceIndexingTreeKlass):
+    int   size, capacity, upThreshold, downThreshold
+    IndexingTreeEntry[] table          <- WeakObjArrayKlass; excluded from oop maps
+
+  IndexingTreeEntry (plain InstanceKlass):
+    int    hashCode
+    int    numKeys
+    Object key1, key2, key3, key4     <- strong inline oops (fast comparison)
+    Object value
+    IndexingTreeEntry next
+
+HOW WEAK SEMANTICS WORK
+-----------------------
+The bucket array (table) is typed WeakObjArrayKlass instead of plain
+ObjArrayKlass. This gives it two special GC behaviors:
+
+  1. InstanceIndexingTreeKlass excludes the table field from the oop map
+     so normal GC traversal never follows tree -> table.
+
+  2. WeakObjArrayKlass::oop_oop_iterate suppresses element scanning
+     during YoungScan (young GC card scanning). This prevents entries
+     from being treated as strongly reachable via the bucket array.
+
+Entries survive only if their keys are reachable from outside the tree.
+At cleanup time (reference processing), clean_bucket_range checks key
+liveness and unlinks dead entries. Surviving entries are explicitly
+kept alive via keep_alive closures.
+
+CLEANUP HOOKS (per collector)
+------------------------------
+  Serial:    post-mark, clean_all_trees (single-threaded)
+  Parallel:  post-scavenge + full-GC mark, clean_all_trees
+  G1:        reference processor path via CleanTreesClosure;
+             young GC defers cleanup when concurrent mark active
+             (YoungScan && StrongMark -> skip, entries survive via card scan)
+  Shenandoah: clean_all_trees_marked (mark-only path, no keep_alive needed)
+  ZGC:       stubbed; 3 unresolved design issues
+
+RESIZE
+------
+adjustCapacity0 is a JNI call. Two reasons:
+  1. new IndexingTreeEntry[n] from Java produces plain ObjArrayKlass, not
+     WeakObjArrayKlass. The JVM allocates the WeakObjArrayKlass-typed array.
+  2. NoSafepointVerifier wraps the rehash. A mid-resize young GC would find
+     moved entries only in the new WeakObjArrayKlass table (suppressed) with
+     no strong root -> entries die. The safepoint guard closes this window.
+
+KEY OPTIMIZATIONS IMPLEMENTED
+------------------------------
+  - Inline key fields (key1..key4) replace the former Object[] keys array.
+    Eliminates one Object[] allocation per entry creation, one pointer
+    dereference per key comparison, and one GC-traced object per entry.
+    ~33% runtime improvement on pmd, ~19% on h2 (10-iteration dacapo runs).
+  - Arity-specific constructors: getOrCreate1/2/3/4 use typed constructors,
+    no new Object[]{...} at the cache-miss call site.
+  - scan1/scan2/scan3 use inline fields directly; scan4 uses key4 field.
+
+PERFORMANCE (G1, Xms2g/Xmx2g, dacapo -n 10, all properties)
+--------------------------------------------------------------
+  pmd:  baseline 1446ms -> inline-key 972ms  (-33%)
+  h2:   baseline 1994ms -> inline-key 1607ms (-19%)
+  fop:  PASS 10/10 (previously crashed deterministically on this workload)
+
+BUG FIXED
+---------
+Deterministic SEGV in clean_bucket_range during G1 concurrent mark
+interleaved with young GC (Pause Young Normal while StrongMark active).
+
+Root cause: WeakObjArrayKlass suppressed card scanning (no roots for
+young-gen entries). clean_tree early-returned (no keep_alive). Entries
+died. Next cleanup read dangling bucket slots -> SEGV on keys->length().
+
+Fix (one line in weak_objarray_suppress):
+  Before: if (S::in(S::YoungScan)) return true;
+  After:  if (S::in(S::YoungScan) && !S::in(S::StrongMark)) return true;
+
+During YoungScan+StrongMark, card scanning is no longer suppressed.
+Entries survive via normal card scan roots. clean_tree early-return
+(defer cleanup until StrongMark clears) is now correct.
+
+WEAKNESSES
+----------
+  - Every new GC algorithm requires its own cleanup hook wiring.
+  - ZGC and Shenandoah integration is incomplete / fragile.
+  - adjustCapacity0 JNI call required due to WeakObjArrayKlass allocation
+    and NoSafepointVerifier constraint.
+  - cleanup is O(table capacity), not O(live entries). At billions of
+    monitors, every GC iterates the entire bucket array including null slots.
+  - Single flat table means resize is O(capacity) during a GC pause.
+  - WeakArrayScanScope is a global flag shared across collectors; the
+    interaction between YoungScan, StrongMark, and G1Mixed bits is subtle
+    and has already caused one deterministic crash.
+
+
+=============================================================
+PROPOSED APPROACH: weak OopStorage handles for keys
+=============================================================
+
+CORE IDEA
+---------
+Store each key as a native weak OopStorage handle (oop* slot) inside the
+entry, not as a strong inline oop. The bucket array becomes a plain oop[]
+(regular ObjArrayKlass). All GC algorithms process weak OopStorage
+automatically via WeakProcessor::weak_oops_do -- no per-collector code.
+
+DATA LAYOUT
+-----------
+  IndexingTree (can revert to plain InstanceKlass):
+    int   size, capacity, upThreshold, downThreshold
+    IndexingTreeEntry[] table          <- plain ObjArrayKlass, STRONG
+
+  IndexingTreeEntry:
+    int    hashCode
+    int    numKeys
+    long   key1Handle, key2Handle, key3Handle, key4Handle  <- oop* as long
+    Object value
+    IndexingTreeEntry next
+
+  OopStorage "IndexingTree Keys" (weak):
+    blocks of oop slots, one per key per live entry
+    WeakProcessor nulls slots when referents die
+
+HOW WEAK SEMANTICS WORK
+-----------------------
+Keys are stored only as weak OopStorage handles. The table array holds
+entries strongly (plain ObjArrayKlass -- card scanning traces it normally).
+When a key becomes unreachable, WeakProcessor nulls its OopStorage slot:
+  *entry.key1Handle == nullptr
+
+An entry is logically dead when any of its key handles is null. Lookup
+checks this during chain traversal and skips/removes dead entries.
+
+No WeakObjArrayKlass. No InstanceIndexingTreeKlass. No WeakArrayScanScope.
+No per-GC hooks. One OopStorage registration covers all collectors.
+
+LOOKUP HOT PATH
+---------------
+  scan2 example:
+    while (head != null) {
+        oop k1 = derefHandle(head.key1Handle);  // *((oop*)head.key1Handle)
+        oop k2 = derefHandle(head.key2Handle);
+        if (k1 == searchKey1 && k2 == searchKey2 && head.numKeys == 2)
+            return head;
+        if (k1 == nullptr || k2 == nullptr) {
+            // dead entry: unlink and continue
+        }
+        head = head.next;
+    }
+
+  derefHandle is a JVM intrinsic compiling to a single load instruction.
+  Cost vs current: one extra load per key per chain step.
+
+RESIZE
+------
+  adjustCapacity can be pure Java. The bucket array is plain oop[] --
+  new IndexingTreeEntry[n] works without JNI. No WeakObjArrayKlass to
+  allocate. The safepoint window problem disappears: entries in the new
+  table are strongly referenced (plain oop[]), so a mid-resize GC finds
+  them normally. No NoSafepointVerifier needed.
+
+CLEANUP
+-------
+  WeakProcessor runs automatically in every GC. No explicit clean_tree
+  call site. Dead entries are detected lazily during lookup or eagerly
+  by a background sweep of the OopStorage (oops_do over null slots).
+  Chain compaction (unlinking tombstones) can be deferred or done on
+  lookup.
+
+MEMORY COST
+-----------
+  Per key:
+    Current:  4 bytes inline (compressed oop in entry field)
+    Proposed: 8 bytes (long handle in entry) + 4 bytes (oop in OopStorage block)
+              = 12 bytes per key
+
+  Per 2-key entry:
+    Current:  48 bytes on-heap (entry with key1..key4, numKeys, etc.)
+    Proposed: ~48 bytes on-heap (key fields replaced by long handles,
+              roughly same size) + 8 bytes off-heap OopStorage per key
+              = ~64 bytes total
+
+  Net: ~16 bytes more per 2-key entry. Significant at billions of entries.
+
+PERFORMANCE TRADEOFF
+--------------------
+  Lookup: one extra load per key comparison vs current (inline field).
+    Theoretical: ~1ns extra on cache hit, ~10ns on miss.
+    Practical: identityHashCode dominates hot path at ~100ns (JNI call).
+    Key comparison cost is a small fraction; extra load likely within noise.
+    Needs benchmarking to confirm.
+
+  GC: WeakProcessor iterates all OopStorage slots per GC. With N entries
+    and K keys each, that is N*K slot reads per GC -- same order as
+    current O(capacity) bucket scan, but done in parallel via
+    OopStorage::ParState. Likely faster at large scale.
+
+  Allocation: OopStorage slot allocation replaces nothing (current has
+    no per-key allocation). Slots come from pre-allocated blocks -- cheap,
+    not Java object allocation. No WeakReference object overhead.
+
+WHAT THIS ELIMINATES
+--------------------
+  - WeakObjArrayKlass and all its logic
+  - InstanceIndexingTreeKlass oop-map manipulation
+  - WeakArrayScanScope (YoungScan, StrongMark, G1Mixed flags)
+  - All per-GC cleanup hook wiring (Serial, Parallel, G1, Shenandoah, ZGC)
+  - adjustCapacity0 JNI call and NoSafepointVerifier workaround
+  - The YoungScan+StrongMark interleaving bug class entirely
+
+WHAT REMAINS COMPLEX
+--------------------
+  - derefHandle must be a recognized JVM intrinsic for the JIT to
+    compile it to a single load. Otherwise it becomes a JNI call, which
+    is worse than the current design.
+  - OopStorage slot allocation/deallocation per key on every insert/remove
+    adds overhead on the cache-miss path.
+  - Dead entries remain in chains until explicitly unlinked. Memory is not
+    freed immediately when keys die -- freed only when the dead entry is
+    encountered during lookup or background sweep. At high death rates,
+    tombstone accumulation could slow lookup.
+  - The background sweep / compaction mechanism still needs design.
+
+
+=============================================================
+COMPARISON SUMMARY
+=============================================================
+
+                          Current              OopStorage handles
+                          -------              ------------------
+GC universality           Per-collector hooks  All GCs automatic
+ZGC / Shenandoah          Incomplete           Works out of the box
+Lookup speed              Fastest (inline)     One extra load per key
+Key comparison            Direct field read    Handle dereference
+Memory per 2-key entry    48 bytes             ~64 bytes
+Entry allocation cost     One Object[]         OopStorage slot alloc per key
+Resize from Java          No (JNI required)    Yes (plain oop[])
+Safepoint window          Requires JNI guard   Does not exist
+GC cleanup complexity     High (per-GC)        Zero (WeakProcessor)
+Concurrent GC             Research problem     Solved by WeakProcessor
+Tombstone accumulation    None                 Needs compaction strategy
+Code to maintain          ~1000 lines C++      ~100 lines C++
+
+RECOMMENDATION
+--------------
+If the target is G1 only and lookup speed is paramount: current approach
+with inline keys is the right choice. The GC fix is stable, ZGC/Shenandoah
+can be addressed later.
+
+If the target is all collectors including ZGC/Shenandoah, or if the
+codebase needs to support future GC algorithms without rework: the
+OopStorage approach is worth prototyping. The key unknown is whether
+derefHandle can be intrinsified cheaply enough that the extra load does
+not measurably slow the monitoring hot path. Benchmark first on a build
+where derefHandle is a true intrinsic, not a JNI call.
