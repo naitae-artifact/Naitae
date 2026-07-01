@@ -1,0 +1,25 @@
+Naitae artifact LICENSE
+===========================
+
+This artifact consists of several components, each by its own license.
+Modifications made for this work inherit the license of the component they modify.
+
+1. jdk21-4-rv/ — modified OpenJDK 21 that implements Naitae.
+   All new and modified code related to Naitae in OpenJDK 21 are Licensed under the GNU General Public License version 2 only, with the Classpath Exception (GPLv2+CE), as in the upstream OpenJDK. Please view jdk21-4-rv/LICENSE and jdk21-4-rv/ADDITIONAL_LICENSE_INFO for more details.
+
+2. env/agents/ — prebuilt RV tool jars (JavaMOP/TraceMOP/Valg, and LazyMOP).
+   These are compiled from the TraceMOP(JavaMOP and Valg) and LazyMOP projects and retains the upstream license of the project it was built from. 
+   
+3. experiments/ and env/ — the evaluation harness, scripts, and Dockerfile.
+   Released under the MIT License (below).
+
+--------------------------------------------------------------------------------
+MIT License (applies to experiments/ and env/ only)
+
+Copyright (c) 2026 The NAITAE authors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
